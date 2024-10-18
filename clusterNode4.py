@@ -58,58 +58,67 @@ def handle_client_request(client_socket, address, local_node_id):
     process_count += 1  
     data = client_socket.recv(1024).decode()
 
-    client_id, timestamp = data.split(',')
-    timestamp = int(timestamp)
+    # Verificar se os dados contêm uma vírgula antes de fazer o split
+    if ',' in data:
+        client_id, timestamp = data.split(',')
+        timestamp = int(timestamp)
 
-    local_cluster.timestamp = timestamp
-    local_cluster.wants_resource = True
+        local_cluster.timestamp = timestamp
+        local_cluster.wants_resource = True
 
-    local_request = {
-        'node_id': local_node_id,
-        'client_id': client_id,
-        'timestamp': timestamp
-    }
+        local_request = {
+            'node_id': local_node_id,
+            'client_id': client_id,
+            'timestamp': timestamp
+        }
 
-    print(f"Processo {process_count}: Requisição de {client_id} recebida com timestamp {timestamp}")
+        print(f"Processo {process_count}: Requisição de {client_id} recebida com timestamp {timestamp}")
+        propagate_to_cluster(local_request)
+        print(f"Processo {process_count}: OKs recebidos: {local_cluster.oks_received}")
+        request_id = f"{client_id}_{timestamp}"
 
-    oks_received = propagate_to_cluster(local_request)
+        wait_for_oks(request_id, local_cluster.oks_received)
 
-    print(f"Processo {process_count}: OKs recebidos: {oks_received}")
+        process_critical_section(local_request)
 
-    request_id = f"{client_id}_{timestamp}"
+        local_cluster.wants_resource = False
 
-    wait_for_oks(request_id, oks_received)
-
-    process_critical_section(local_request)
-
-    local_cluster.wants_resource = False
-
-    if local_node_id == local_cluster.node_id:
-        client_socket.send(f"COMMITTED for {client_id} at timestamp {timestamp}".encode())
+        if local_node_id == local_cluster.node_id:
+            client_socket.send(f"COMMITTED for {client_id} at timestamp {timestamp}".encode())
+    else:
+        # Tratamento para OK ou outras respostas
+        if data == "OK":
+            local_cluster.oks_received += 1
+            print(f"Processo {process_count}: OK recebido de {address}")
+        else:
+            print(f"Processo {process_count}: Mensagem inesperada recebida: {data}")
 
     client_socket.close()
 
     # Envia OK para processos na fila após sair da seção crítica
     finish_critical_section(local_cluster)
 
+
 def propagate_to_cluster(request):
     """
     Propaga a requisição atual para os outros nós do Cluster Sync.
     """
-    oks_received = 0
+    local_cluster.oks_received = 0
     for node in cluster_nodes:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as node_socket:
             try:
                 node_socket.connect((node.ip, node.port))  # Conexão ao nó
                 node_socket.send(json.dumps(request).encode())
                 ack = node_socket.recv(1024).decode()
+                if(ack == "WAIT"):
+                    while True:
+                        if node_socket.recv(1024).decode() == "OK":
+                            break
                 print(f"Processo {process_count}: {ack} de {node.node_id} recebido")
-                oks_received += 1
+                local_cluster.oks_received += 1
             except Exception as e:
                 print(f"Processo {process_count}: Falha ao conectar com {node.node_id}: {e}")
   
-    return oks_received
-
 def process_critical_section(request):
     """
     Simula o processamento na seção crítica, garantindo que apenas um cliente por vez
@@ -129,7 +138,7 @@ def wait_for_oks(request_id, oks_received):
         if oks_received == len(cluster_nodes):
             break
         time.sleep(0.1)
-  
+
     print(f"Processo {process_count}: Todos os OKs recebidos para a requisição {request_id}. Entrando na seção crítica...")
 
 def finish_critical_section(local_cluster):
@@ -137,9 +146,10 @@ def finish_critical_section(local_cluster):
     Função chamada quando o processo termina de acessar a seção crítica.
     Envia OK para todos os processos que estão aguardando na fila.
     """
+    # Enquanto houver processos aguardando na fila
     while local_cluster.queue:
         queued_request = local_cluster.queue.pop(0)  # Remove a requisição mais antiga da fila
-        send_ok_to(queued_request["client_id"])  # Envia OK para o cliente
+        send_ok_to(queued_request["client_id"])  # Envia OK para o cliente da requisição
 
     print(f"Processo {process_count}: OKs enviados para todos os processos na fila.")
 
@@ -147,24 +157,26 @@ def send_ok_to(client_id):
     """
     Envia uma mensagem OK para o cliente que solicitou acesso ao recurso.
     """
-    message = {"response": "OK"}
-    # Simula o envio de uma mensagem OK ao processo remetente (cliente)
-    send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Procura o nó correspondente ao client_id
     send_cluster = None
-    
     for cluster in cluster_nodes:
         if cluster.client_id == client_id:
             send_cluster = cluster
             break
     
+    # Verifica se encontrou o nó correto
     if send_cluster:
         try:
-            send_socket.connect((send_cluster.ip, send_cluster.port))
+            # Envia um OK para o nó (usando a porta correta)
+            send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            send_socket.connect((send_cluster.ip, send_cluster.port-1000))
             send_socket.send("OK".encode())
             send_socket.close()
             print(f"Processo {process_count}: OK enviado para o nó associado ao {client_id}")
         except Exception as e:
             print(f"Erro ao enviar OK para {client_id}: {e}")
+    else:
+        print(f"Nó associado ao {client_id} não encontrado.")
 #-------------------------------------------------------------------CLUSTER-------------------------------------------------------------------------------
 
 def cluster_sync_server(host, port, local_node_id):
@@ -185,9 +197,11 @@ def cluster_sync_server(host, port, local_node_id):
         request_received = handle_propagated_request(request_data)  
         print(f"Requisição recebida de {request_received['client_id']} com timestamp {request_received['timestamp']}")
 
-        process_request(request_received, local_cluster)
+        if process_request(request_received, local_cluster):
+            node_connection.send("OK".encode())
+        else:
+            node_connection.send("WAIT".encode())
 
-   #     node_connection.send("OK".encode())
         node_connection.close()
 
 def handle_propagated_request(request_data):
@@ -201,24 +215,33 @@ def process_request(request_received, local_cluster):
     """
     Processa a requisição recebida de outro nó e toma ação baseada nas regras do algoritmo.
     """
+
+    send_ok = False
+
     sender_client_id = request_received["client_id"]
     sender_timestamp = request_received["timestamp"]
 
     # Se o receptor não estiver acessando o recurso e não quiser acessá-lo (regra 1)
     if not local_cluster.accessing_resource and not local_cluster.wants_resource:
-        send_ok_to(sender_client_id)  # Envia OK ao remetente
+        send_ok = True
+        #send_ok_to(sender_client_id)  # Envia OK ao remetente
 
     # Se o receptor já estiver acessando o recurso (regra 2)
     elif local_cluster.accessing_resource:
         local_cluster.queue.append(request_received)  # Enfileira a requisição
+        send_ok = True
 
     # Se o receptor também quiser acessar o recurso (regra 3)
     elif local_cluster.wants_resource:
         # Compara os timestamps: o menor vence
         if sender_timestamp < local_cluster.timestamp:
-            send_ok_to(sender_client_id)  # Envia OK ao remetente
+            send_ok = True
+          #  send_ok_to(sender_client_id)  # Envia OK ao remetente
         else:
             local_cluster.queue.append(request_received)  # Enfileira a requisição
+            send_ok = True
+    
+    return send_ok
             
 #-------------------------------------------------------------------MAIN-------------------------------------------------------------------------------
 

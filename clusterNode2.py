@@ -29,7 +29,7 @@ cluster4 = ClusterNode("127.0.0.1", 6004, "Peer4", "Client4")
 cluster5 = ClusterNode("127.0.0.1", 6005, "Peer5", "Client5")
 
 # Lista de nós do cluster
-cluster_nodes = [cluster1, cluster3]
+cluster_nodes = [cluster1, cluster3, cluster4, cluster5]
 
 process_count = 0  # Contador para o número de processos
 
